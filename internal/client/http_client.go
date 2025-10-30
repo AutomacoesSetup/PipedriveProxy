@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"pipedrive_api_service/internal/upstream"
 	"pipedrive_api_service/internal/utils"
 )
 
@@ -42,6 +44,7 @@ func (c *PipedriveClient) Do(ctx context.Context, method utils.HTTPMethod, path 
 	return c.DoWithBody(ctx, method, path, q, nil)
 }
 
+// DoWithBody delegates to global broker when available.
 func (c *PipedriveClient) DoWithBody(ctx context.Context, method utils.HTTPMethod, path string, q url.Values, bodyReader io.Reader) (*http.Response, []byte, *utils.RateLimitInfo, error) {
 	if q == nil {
 		q = url.Values{}
@@ -55,30 +58,48 @@ func (c *PipedriveClient) DoWithBody(ctx context.Context, method utils.HTTPMetho
 	u.Path = u.Path + path
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, string(method), u.String(), bodyReader)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("new request: %w", err)
-	}
-
+	var bodyBytes []byte
 	if bodyReader != nil {
-		req.Header.Set("Content-Type", "application/json")
+		bodyBytes, _ = io.ReadAll(bodyReader)
 	}
 
-	req.Header.Set("User-Agent", c.userAgent)
-	req.Header.Set(utils.HeaderContentType, utils.ContentTypeJSON)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("http do: %w", err)
+	headers := map[string]string{
+		"User-Agent":            c.userAgent,
+		utils.HeaderContentType: utils.ContentTypeJSON,
 	}
 
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	rate := utils.ExtractRateLimitFromHeaders(resp.Header)
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return resp, body, rate, fmt.Errorf("rate limit exceeded (429)")
+	broker := upstream.GlobalBroker()
+	if broker == nil {
+		// fallback to direct HTTP
+		var reader io.Reader
+		if len(bodyBytes) > 0 {
+			reader = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, string(method), u.String(), reader)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("new request: %w", err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("http do: %w", err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		rate := utils.ExtractRateLimitFromHeaders(resp.Header)
+		respCopy := &http.Response{
+			Status:        resp.Status,
+			StatusCode:    resp.StatusCode,
+			Header:        resp.Header.Clone(),
+			Body:          io.NopCloser(bytes.NewReader(b)),
+			ContentLength: int64(len(b)),
+			Request:       resp.Request,
+		}
+		return respCopy, b, rate, nil
 	}
 
-	return resp, body, rate, nil
+	resp, b, rate, err := broker.Execute(ctx, string(method), u.String(), headers, bodyBytes, 3)
+	return resp, b, rate, err
 }
